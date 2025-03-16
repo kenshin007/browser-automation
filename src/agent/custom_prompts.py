@@ -86,6 +86,49 @@ class CustomSystemPrompt(SystemPrompt):
 9. Extraction:
     - If your task is to find information or do research - call extract_content on the specific pages to get and store the information.
 
+4. VERIFICATION TASKS:
+   - When the task includes a verification request (e.g., "verify that X is Y"):
+     1. Identify the information needed to perform the verification.
+     2. Use actions like 'get_element_attributes' or 'extract_page_content' to gather data.
+     3. Analyze the data to determine if the condition is met.
+     4. When completing the task, ALWAYS use this exact format:
+        ```
+        {
+          "current_state": {
+            "prev_action_evaluation": "Success - [brief evaluation]",
+            "important_contents": "[relevant content]",
+            "task_progress": "[progress so far]",
+            "future_plans": "",
+            "thought": "I have verified that [specific thing verified]. [detailed reasoning]",
+            "summary": "Verification complete."
+          },
+          "action": [
+            {"done": {"text": "Verification: Passed. I verified that [specific thing verified]. Here's my analysis: [detailed reasoning explaining what you found and how it compares to the expected condition]."}}
+          ]
+        }
+        ```
+        or for failed verification:
+        ```
+        {
+          "current_state": {
+            "prev_action_evaluation": "Success - [brief evaluation]",
+            "important_contents": "[relevant content]",
+            "task_progress": "[progress so far]",
+            "future_plans": "",
+            "thought": "I have verified that [specific thing verified]. [detailed reasoning]",
+            "summary": "Verification complete."
+          },
+          "action": [
+            {"done": {"text": "Verification: Failed. I verified that [specific thing verified]. Here's my analysis: [detailed reasoning explaining what you found and how it compares to the expected condition]."}}
+          ]
+        }
+        ```
+   - For element attribute verification, use the 'get_element_attributes' action to check properties like 'href', 'disabled', 'tag_name', etc.
+   - Be thorough in your verification and provide clear reasoning for your conclusion.
+   - IMPORTANT: Your final output MUST include detailed reasoning explaining your verification process and MUST explicitly state "Verification: Passed" or "Verification: Failed" to be properly detected by the testing system.
+   - Always include specific evidence from the page that supports your conclusion, such as exact text found, attribute values, or other relevant details.
+   - NEVER output just the "done" action without the proper "current_state" structure.
+
 """
         text += f"   - use maximum {self.max_actions_per_step} actions per sequence"
         return text
@@ -132,6 +175,31 @@ class CustomAgentMessagePrompt(AgentMessagePrompt):
                                                        step_info=step_info
                                                        )
         self.actions = actions
+
+    def include_attributes(self) -> list[str]:
+        """
+        Returns the attributes to include in the browser state.
+        """
+        return [
+            'title',
+            'type',
+            'name',
+            'role',
+            'tabindex',
+            'aria-label',
+            'placeholder',
+            'value',
+            'alt',
+            'aria-expanded',
+            'href',
+            'disabled',
+            'tag_name',
+            'inner_text',
+            'checked',
+            'selected',
+            'id',
+            'class'
+        ]
 
     def get_user_message(self, use_vision: bool = True) -> HumanMessage:
         if self.step_info:

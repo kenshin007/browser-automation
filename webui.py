@@ -705,6 +705,250 @@ async def run_deep_search(research_task, max_search_iteration_input, max_query_p
     return markdown_content, file_path, gr.update(value="Stop", interactive=True),  gr.update(interactive=True) 
     
 
+async def run_verification_test(
+    test_case_name, task_description, verification_condition,
+    llm_provider, llm_model_name, llm_temperature, llm_num_ctx,
+    max_steps, max_actions_per_step, use_vision, tool_calling_method,
+    use_own_browser, keep_browser_open, headless, window_w, window_h,
+    save_recording_path, save_trace_path
+):
+    """Run the agent with the specified configurations for verification testing."""
+    global _global_browser, _global_browser_context, _global_agent, _global_agent_state
+    
+    # Clear any previous stop requests
+    _global_agent_state.clear_stop()
+    
+    if not task_description.strip() or not verification_condition.strip():
+        error_html = """
+        <div class="test-result-container">
+            <div class="verification-failed">ERROR</div>
+            <div class="test-details failed">
+                Task Description and Verification Condition are required.
+            </div>
+        </div>
+        """
+        return "Error: Task Description and Verification Condition are required.", error_html
+
+    # Combine task description and verification condition
+    full_task = f"{task_description.strip()} and {verification_condition.strip()}"
+    
+    # Create LLM instance
+    llm = utils.get_llm_model(
+        provider=llm_provider,
+        model_name=llm_model_name,
+        temperature=llm_temperature,
+        num_ctx=llm_num_ctx if llm_provider == "ollama" else None
+    )
+    
+    # Browser setup
+    extra_chromium_args = []
+    chrome_path = None
+    
+    if use_own_browser:
+        chrome_path = os.getenv("CHROME_PATH", None)
+        if chrome_path:
+            extra_chromium_args += [f"--user-data-dir={os.getenv('CHROME_USER_DATA', '')}"]
+    
+    controller = CustomController()
+    
+    # Initialize browser if needed
+    if _global_browser is None:
+        _global_browser = CustomBrowser(
+            config=BrowserConfig(
+                headless=headless,
+                disable_security=True,
+                chrome_instance_path=chrome_path,
+                extra_chromium_args=extra_chromium_args,
+            )
+        )
+    
+    if _global_browser_context is None:
+        _global_browser_context = await _global_browser.new_context(
+            config=BrowserContextConfig(
+                trace_path=save_trace_path if save_trace_path else None,
+                save_recording_path=save_recording_path if save_recording_path else None,
+                no_viewport=False,
+                browser_window_size=BrowserContextWindowSize(
+                    width=window_w, height=window_h
+                ),
+            )
+        )
+    
+    # Create and run agent
+    _global_agent = CustomAgent(
+        task=full_task,
+        add_infos="",
+        use_vision=use_vision,
+        llm=llm,
+        browser=_global_browser,
+        browser_context=_global_browser_context,
+        controller=controller,
+        system_prompt_class=CustomSystemPrompt,
+        agent_prompt_class=CustomAgentMessagePrompt,
+        max_actions_per_step=max_actions_per_step,
+        tool_calling_method=tool_calling_method
+    )
+    
+    try:
+        history = await _global_agent.run(max_steps=max_steps)
+        
+        # Parse the final result
+        final_result = history.final_result()
+        
+        # Format the test case name
+        formatted_test_name = test_case_name if test_case_name.strip() else "Untitled Test"
+        
+        # Initialize verification variables
+        verification_passed = False
+        verification_failed = False
+        verification_text = ""
+        failure_reason = ""
+        analysis_text = ""
+        
+        # Extract verification result from the agent's history
+        # First, check the raw model actions log for the done action
+        model_actions_log = history.model_actions() if hasattr(history, 'model_actions') else ""
+        
+        # Look for the done action in the raw log
+        if model_actions_log and isinstance(model_actions_log, str):
+            import json
+            import re
+            
+            # Look for the done action with verification text
+            # This pattern matches both the JSON format and the log format
+            done_matches = re.findall(r'(?:{"done":\s*{"text":\s*"([^"]+)"}}|Action \d+/\d+: {"done":{"text":"([^"]+)"}})', model_actions_log)
+            
+            if done_matches:
+                for match in done_matches:
+                    # If it's a tuple (from the regex groups), get the non-empty value
+                    if isinstance(match, tuple):
+                        last_done_text = next((m for m in match if m), "")
+                    else:
+                        last_done_text = match
+                    
+                    if "Verification: Passed" in last_done_text:
+                        verification_passed = True
+                        verification_text = last_done_text
+                        break
+                    elif "Verification: Failed" in last_done_text:
+                        verification_failed = True
+                        verification_text = last_done_text
+                        # Try to extract failure reason if available
+                        if ":" in last_done_text.split("Verification: Failed")[1]:
+                            failure_reason = last_done_text.split("Verification: Failed")[1].split(":")[1].strip()
+                        break
+        
+        # If we couldn't find verification in the model actions, check the final result
+        if not verification_passed and not verification_failed and final_result:
+            if "Verification: Passed" in final_result:
+                verification_passed = True
+                verification_text = final_result
+            elif "Verification: Failed" in final_result:
+                verification_failed = True
+                verification_text = final_result
+                # Try to extract failure reason if available
+                if ":" in final_result.split("Verification: Failed")[1]:
+                    failure_reason = final_result.split("Verification: Failed")[1].split(":")[1].strip()
+        
+        # Generate the appropriate HTML based on verification result
+        if verification_passed:
+            result_html = f"""
+            <div class="test-result-container">
+                <div class="test-result-header">Test: {formatted_test_name}</div>
+                <div class="verification-passed">✅ PASSED</div>
+                <div class="test-details passed">
+                    <strong>Agent Output:</strong> {verification_text}
+                </div>
+            </div>
+            """
+            status = "Passed"
+        elif verification_failed:
+            result_html = f"""
+            <div class="test-result-container">
+                <div class="test-result-header">Test: {formatted_test_name}</div>
+                <div class="verification-failed">❌ FAILED</div>
+                <div class="test-details failed">
+                    <strong>Agent Output:</strong> {verification_text}
+                    <br><br><strong>Reason:</strong> {failure_reason if failure_reason else "Test conditions were not met."}
+                </div>
+            </div>
+            """
+            status = "Failed"
+        else:
+            # Truly unclear result
+            result_html = f"""
+            <div class="test-result-container">
+                <div class="test-result-header">Test: {formatted_test_name}</div>
+                <div class="verification-unclear">⚠️ UNCLEAR</div>
+                <div class="test-details unclear">
+                    <strong>The agent did not clearly indicate verification status.</strong>
+                    <br><br><strong>Agent Output:</strong> {final_result if final_result else "No result returned from agent."}
+                </div>
+            </div>
+            """
+            if final_result:
+                final_result += "\nNote: Agent did not clearly indicate verification status."
+            else:
+                final_result = "No result returned from agent."
+            status = "Unclear"
+        
+        # Log the test result
+        log_test_result(test_case_name, task_description, verification_condition, status)
+        
+        return final_result, result_html
+    except Exception as e:
+        error_message = f"Error running verification test: {str(e)}"
+        logger.error(error_message)
+        error_html = f"""
+        <div class="test-result-container">
+            <div class="verification-failed">❌ ERROR</div>
+            <div class="test-details failed">
+                {error_message}
+            </div>
+        </div>
+        """
+        return error_message, error_html
+    finally:
+        # Clean up resources if not keeping browser open
+        if not keep_browser_open:
+            if _global_browser_context:
+                await _global_browser_context.close()
+                _global_browser_context = None
+            if _global_browser:
+                await _global_browser.close()
+                _global_browser = None
+            _global_agent = None
+
+def log_test_result(test_name, task, verification, result):
+    """Log test results to task-logs.md file."""
+    import datetime
+    
+    log_file = "task-logs.md"
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Create log entry
+    log_entry = f"""
+## {test_name}
+
+GOAL: {task} and {verification}
+IMPLEMENTATION: Ran verification test using the agent with verification capabilities.
+RESULT: {result}
+COMPLETED: {now}
+
+---
+"""
+    
+    # Append to log file
+    try:
+        with open(log_file, "a") as f:
+            f.write(log_entry)
+    except Exception as e:
+        logger.error(f"Error writing to log file: {str(e)}")
+
+def update_llm_num_ctx_visibility(provider):
+    """Show/hide the context length slider based on the provider."""
+    return gr.update(visible=provider == "ollama")
+
 def create_ui(config, theme_name="Ocean"):
     css = """
     .gradio-container {
@@ -720,6 +964,95 @@ def create_ui(config, theme_name="Ocean"):
         margin-bottom: 20px;
         padding: 15px;
         border-radius: 10px;
+    }
+    .verification-passed {
+        color: green;
+        font-weight: bold;
+        padding: 10px;
+        border-radius: 5px;
+        background-color: rgba(0, 255, 0, 0.1);
+        display: inline-block;
+        margin-top: 10px;
+        text-align: center;
+        width: 100%;
+        font-size: 18px;
+    }
+    .verification-failed {
+        color: red;
+        font-weight: bold;
+        padding: 10px;
+        border-radius: 5px;
+        background-color: rgba(255, 0, 0, 0.1);
+        display: inline-block;
+        margin-top: 10px;
+        text-align: center;
+        width: 100%;
+        font-size: 18px;
+    }
+    .verification-unclear {
+        color: orange;
+        font-weight: bold;
+        padding: 10px;
+        border-radius: 5px;
+        background-color: rgba(255, 165, 0, 0.1);
+        display: inline-block;
+        margin-top: 10px;
+        text-align: center;
+        width: 100%;
+        font-size: 18px;
+    }
+    .verification-not-run {
+        color: gray;
+        font-weight: bold;
+        padding: 10px;
+        border-radius: 5px;
+        background-color: rgba(128, 128, 128, 0.1);
+        display: inline-block;
+        margin-top: 10px;
+        text-align: center;
+        width: 100%;
+        font-size: 18px;
+    }
+    .test-result-container {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 15px;
+        margin-top: 20px;
+        background-color: #f9f9f9;
+    }
+    .test-result-header {
+        font-weight: bold;
+        margin-bottom: 10px;
+        font-size: 16px;
+    }
+    .test-details {
+        margin-top: 15px;
+        padding: 10px;
+        background-color: white;
+        border-radius: 5px;
+        border-left: 4px solid #ccc;
+        line-height: 1.5;
+        white-space: pre-line;
+    }
+    .test-details.passed {
+        border-left-color: green;
+    }
+    .test-details.failed {
+        border-left-color: red;
+    }
+    .test-details.unclear {
+        border-left-color: orange;
+    }
+    .test-details strong {
+        font-weight: bold;
+        color: #333;
+    }
+    .analysis-section {
+        margin-top: 10px;
+        padding: 10px;
+        background-color: #f5f5f5;
+        border-radius: 5px;
+        font-style: italic;
     }
     """
 
@@ -824,8 +1157,9 @@ def create_ui(config, theme_name="Ocean"):
                         )
 
             # Change event to update context length slider
-            def update_llm_num_ctx_visibility(llm_provider):
-                return gr.update(visible=llm_provider == "ollama")
+            def update_llm_num_ctx_visibility(provider):
+                """Show/hide the context length slider based on the provider."""
+                return gr.update(visible=provider == "ollama")
 
             # Bind the change event of llm_provider to update the visibility of context length slider
             llm_provider.change(
@@ -892,14 +1226,6 @@ def create_ui(config, theme_name="Ocean"):
                         interactive=True,  # Allow editing only if recording is enabled
                     )
 
-                    save_recording_path = gr.Textbox(
-                        label="Recording Path",
-                        placeholder="e.g. ./tmp/record_videos",
-                        value=config['save_recording_path'],
-                        info="Path to save browser recordings",
-                        interactive=True,  # Allow editing only if recording is enabled
-                    )
-
                     save_trace_path = gr.Textbox(
                         label="Trace Path",
                         placeholder="e.g. ./tmp/traces",
@@ -952,8 +1278,150 @@ def create_ui(config, theme_name="Ocean"):
                 markdown_output_display = gr.Markdown(label="Research Report")
                 markdown_download = gr.File(label="Download Research Report")
 
+            # Add Testing Tab
+            with gr.TabItem("🧪 Testing", id=6):
+                with gr.Group():
+                    # Test Case Inputs
+                    test_case_name = gr.Textbox(
+                        label="Test Case Name",
+                        placeholder="e.g., Verify Issue Title",
+                        value="Untitled Test"
+                    )
+                    task_description = gr.Textbox(
+                        label="Task Description",
+                        lines=4,
+                        placeholder="e.g., Navigate to https://github.com/repo/issues and find the 2nd issue"
+                    )
+                    verification_condition = gr.Textbox(
+                        label="Verification Condition",
+                        lines=2,
+                        placeholder="e.g., Verify that the 2nd issue title is 'Fix Bug XYZ'"
+                    )
 
-            with gr.TabItem("📊 Results", id=6):
+                    # LLM Configuration
+                    with gr.Row():
+                        llm_provider = gr.Dropdown(
+                            label="LLM Provider",
+                            choices=["openai", "anthropic", "ollama"],
+                            value=config['llm_provider'],
+                            info="Select the LLM provider to use"
+                        )
+                        llm_model_name = gr.Dropdown(
+                            label="LLM Model",
+                            choices=utils.model_names.get(config['llm_provider'], []),
+                            value=config['llm_model_name'],
+                            interactive=True,
+                            allow_custom_value=True
+                        )
+                    llm_temperature = gr.Slider(
+                        minimum=0.0,
+                        maximum=2.0,
+                        value=config['llm_temperature'],
+                        step=0.1,
+                        label="Temperature",
+                        info="Higher values make output more random, lower values more deterministic"
+                    )
+                    llm_num_ctx = gr.Slider(
+                        minimum=256,
+                        maximum=65536,
+                        value=config['llm_num_ctx'],
+                        step=1,
+                        label="Context Length",
+                        visible=config['llm_provider'] == "ollama",
+                        info="Maximum context length for the model (only for Ollama)"
+                    )
+
+                    # Agent Settings
+                    with gr.Row():
+                        max_steps = gr.Slider(
+                            minimum=1,
+                            maximum=200,
+                            value=config['max_steps'],
+                            step=1,
+                            label="Max Steps",
+                            info="Maximum number of steps the agent will take"
+                        )
+                        max_actions_per_step = gr.Slider(
+                            minimum=1,
+                            maximum=20,
+                            value=config['max_actions_per_step'],
+                            step=1,
+                            label="Max Actions per Step",
+                            info="Maximum number of actions the agent can take in a single step"
+                        )
+                    use_vision = gr.Checkbox(
+                        label="Use Vision",
+                        value=config['use_vision'],
+                        info="Enable vision capabilities for the agent"
+                    )
+                    tool_calling_method = gr.Dropdown(
+                        label="Tool Calling Method",
+                        choices=["auto", "json_schema", "function_calling"],
+                        value=config['tool_calling_method'],
+                        info="Method used for tool calling"
+                    )
+
+                    # Advanced Settings (Collapsible)
+                    with gr.Accordion("Advanced Settings", open=False):
+                        with gr.Group():
+                            # Browser Settings
+                            use_own_browser = gr.Checkbox(
+                                label="Use Own Browser",
+                                value=config['use_own_browser'],
+                                info="Use your own browser instance"
+                            )
+                            keep_browser_open = gr.Checkbox(
+                                label="Keep Browser Open",
+                                value=config['keep_browser_open'],
+                                info="Keep the browser open after the agent finishes"
+                            )
+                            headless = gr.Checkbox(
+                                label="Headless Mode",
+                                value=config['headless'],
+                                info="Run the browser in headless mode (no UI)"
+                            )
+                            with gr.Row():
+                                window_w = gr.Number(
+                                    label="Window Width",
+                                    value=config['window_w'],
+                                    info="Browser window width"
+                                )
+                                window_h = gr.Number(
+                                    label="Window Height",
+                                    value=config['window_h'],
+                                    info="Browser window height"
+                                )
+                            # Recording and Trace Paths
+                            save_recording_path = gr.Textbox(
+                                label="Recording Path",
+                                placeholder="e.g., ./tmp/record_videos",
+                                value=config['save_recording_path'],
+                                info="Path to save browser recordings"
+                            )
+                            save_trace_path = gr.Textbox(
+                                label="Trace Path",
+                                placeholder="e.g., ./tmp/traces",
+                                value=config['save_trace_path'],
+                                info="Path to save browser traces"
+                            )
+
+                    # Run Test Button
+                    run_test_button = gr.Button("Run Test", variant="primary")
+
+                    # Outputs
+                    with gr.Row():
+                        verification_result = gr.Textbox(
+                            label="Agent Output",
+                            lines=10,
+                            interactive=False,
+                            placeholder="Agent output and verification result will appear here"
+                        )
+                        
+                    pass_fail_badge = gr.HTML(
+                        value='<div class="test-result-container"><div class="verification-not-run">⏱️ NOT RUN</div></div>'
+                    )
+
+            with gr.TabItem("📊 Results", id=7):
                 with gr.Group():
 
                     recording_display = gr.Video(label="Latest Recording")
@@ -1025,7 +1493,7 @@ def create_ui(config, theme_name="Ocean"):
                     outputs=[stop_research_button, research_button],
                 )
 
-            with gr.TabItem("🎥 Recordings", id=7):
+            with gr.TabItem("🎥 Recordings", id=8):
                 def list_recordings(save_recording_path):
                     if not os.path.exists(save_recording_path):
                         return []
@@ -1059,7 +1527,7 @@ def create_ui(config, theme_name="Ocean"):
                     outputs=recordings_gallery
                 )
             
-            with gr.TabItem("📁 Configuration", id=8):
+            with gr.TabItem("📁 Configuration", id=9):
                 with gr.Group():
                     config_file_input = gr.File(
                         label="Load Config File",
@@ -1100,11 +1568,23 @@ def create_ui(config, theme_name="Ocean"):
                     outputs=[config_status]
                 )
 
+            # Run Test Button
+            run_test_button.click(
+                fn=run_verification_test,
+                inputs=[
+                    test_case_name, task_description, verification_condition,
+                    llm_provider, llm_model_name, llm_temperature, llm_num_ctx,
+                    max_steps, max_actions_per_step, use_vision, tool_calling_method,
+                    use_own_browser, keep_browser_open, headless, window_w, window_h,
+                    save_recording_path, save_trace_path
+                ],
+                outputs=[verification_result, pass_fail_badge]
+            )
 
         # Attach the callback to the LLM provider dropdown
         llm_provider.change(
-            lambda provider, api_key, base_url: update_model_dropdown(provider, api_key, base_url),
-            inputs=[llm_provider, llm_api_key, llm_base_url],
+            fn=update_model_dropdown,
+            inputs=llm_provider,
             outputs=llm_model_name
         )
 
