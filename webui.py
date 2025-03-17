@@ -44,6 +44,93 @@ _global_agent = None
 # Create the global agent state instance
 _global_agent_state = AgentState()
 
+def save_test_case(test_case_name, task_description, verification_condition):
+    """Save a test case to a JSON file."""
+    import json
+    import os
+    import datetime
+    
+    # Create test cases directory if it doesn't exist
+    test_cases_dir = "test_cases"
+    os.makedirs(test_cases_dir, exist_ok=True)
+    
+    # Generate a filename based on the test case name
+    filename = test_case_name.strip()
+    if not filename:
+        filename = "Untitled Test"
+    
+    # Add timestamp to ensure uniqueness
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{filename}_{timestamp}.json"
+    
+    # Clean filename of invalid characters
+    filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
+    filename = os.path.join(test_cases_dir, filename)
+    
+    # Create test case data
+    test_case = {
+        "name": test_case_name,
+        "task_description": task_description,
+        "verification_condition": verification_condition,
+        "created_at": datetime.datetime.now().isoformat()
+    }
+    
+    # Save to file
+    try:
+        with open(filename, "w") as f:
+            json.dump(test_case, f, indent=2)
+        return f"Test case saved to {filename}", gr.update()  # Don't try to update the file component
+    except Exception as e:
+        return f"Error saving test case: {str(e)}", gr.update()
+
+def load_test_case(test_case_file):
+    """Load a test case from a JSON file."""
+    import json
+    
+    try:
+        if not test_case_file:
+            return "No file selected", gr.update(), gr.update(), gr.update()
+        
+        with open(test_case_file.name, "r") as f:
+            test_case = json.load(f)
+        
+        return (
+            f"Test case '{test_case['name']}' loaded successfully",
+            gr.update(value=test_case.get("name", "")),
+            gr.update(value=test_case.get("task_description", "")),
+            gr.update(value=test_case.get("verification_condition", ""))
+        )
+    except Exception as e:
+        return f"Error loading test case: {str(e)}", gr.update(), gr.update(), gr.update()
+
+def list_test_cases():
+    """List all available test cases."""
+    import os
+    import glob
+    import json
+    
+    test_cases_dir = "test_cases"
+    if not os.path.exists(test_cases_dir):
+        return []
+    
+    test_case_files = glob.glob(os.path.join(test_cases_dir, "*.json"))
+    test_cases = []
+    
+    for file_path in test_case_files:
+        try:
+            with open(file_path, "r") as f:
+                test_case = json.load(f)
+                test_cases.append((file_path, f"{test_case.get('name', 'Unnamed')} - {test_case.get('created_at', '')}"))
+        except:
+            # Skip files that can't be parsed
+            continue
+    
+    return test_cases
+
+def update_llm_num_ctx_visibility(provider):
+    """Show/hide the context length slider based on the provider."""
+    return gr.update(visible=provider == "ollama")
+
 def resolve_sensitive_env_variables(text):
     """
     Replace environment variable placeholders ($SENSITIVE_*) with their values.
@@ -535,6 +622,7 @@ async def run_with_stream(
         # Add HTML content at the start of the result array
         html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Using browser...</h1>"
         yield [html_content] + list(result)
+
     else:
         try:
             _global_agent_state.clear_stop()
@@ -803,42 +891,63 @@ async def run_verification_test(
         verification_failed = False
         verification_text = ""
         failure_reason = ""
-        analysis_text = ""
         
-        # Extract verification result from the agent's history
-        # First, check the raw model actions log for the done action
-        model_actions_log = history.model_actions() if hasattr(history, 'model_actions') else ""
-        
-        # Look for the done action in the raw log
-        if model_actions_log and isinstance(model_actions_log, str):
-            import json
-            import re
-            
-            # Look for the done action with verification text
-            # This pattern matches both the JSON format and the log format
-            done_matches = re.findall(r'(?:{"done":\s*{"text":\s*"([^"]+)"}}|Action \d+/\d+: {"done":{"text":"([^"]+)"}})', model_actions_log)
-            
-            if done_matches:
-                for match in done_matches:
-                    # If it's a tuple (from the regex groups), get the non-empty value
-                    if isinstance(match, tuple):
-                        last_done_text = next((m for m in match if m), "")
-                    else:
-                        last_done_text = match
-                    
-                    if "Verification: Passed" in last_done_text:
-                        verification_passed = True
-                        verification_text = last_done_text
-                        break
-                    elif "Verification: Failed" in last_done_text:
-                        verification_failed = True
-                        verification_text = last_done_text
-                        # Try to extract failure reason if available
-                        if ":" in last_done_text.split("Verification: Failed")[1]:
-                            failure_reason = last_done_text.split("Verification: Failed")[1].split(":")[1].strip()
+        # Check history for done actions
+        if hasattr(history, 'history') and history.history:
+            # Iterate through history items in reverse order to find the most recent done action
+            for history_item in reversed(history.history):
+                if hasattr(history_item, 'model_output') and history_item.model_output and hasattr(history_item.model_output, 'action'):
+                    for action in history_item.model_output.action:
+                        # Check if this is a done action by looking for a 'done' key in the action dict
+                        action_dict = action.model_dump() if hasattr(action, 'model_dump') else {}
+                        if 'done' in action_dict and action_dict['done']:
+                            # Extract the text from the done action
+                            done_text = action_dict['done'].get('text', '')
+                            if "Verification: Passed" in done_text:
+                                verification_passed = True
+                                verification_text = done_text
+                                break
+                            elif "Verification: Failed" in done_text:
+                                verification_failed = True
+                                verification_text = done_text
+                                # Try to extract failure reason
+                                if ":" in done_text.split("Verification: Failed")[1]:
+                                    failure_reason = done_text.split("Verification: Failed")[1].split(":")[1].strip()
+                                break
+                    if verification_passed or verification_failed:
                         break
         
-        # If we couldn't find verification in the model actions, check the final result
+        # If we couldn't find a done action with verification text, check the model_actions_log
+        if not verification_passed and not verification_failed:
+            model_actions_log = history.model_actions() if hasattr(history, 'model_actions') else ""
+            
+            if model_actions_log and isinstance(model_actions_log, str):
+                import re
+                
+                # Look for the done action with verification text
+                done_matches = re.findall(r'(?:{"done":\s*{"text":\s*"([^"]+)"}}|Action \d+/\d+: {"done":{"text":"([^"]+)"}})', model_actions_log)
+                
+                if done_matches:
+                    for match in done_matches:
+                        # If it's a tuple (from the regex groups), get the non-empty value
+                        if isinstance(match, tuple):
+                            done_text = next((m for m in match if m), "")
+                        else:
+                            done_text = match
+                        
+                        if "Verification: Passed" in done_text:
+                            verification_passed = True
+                            verification_text = done_text
+                            break
+                        elif "Verification: Failed" in done_text:
+                            verification_failed = True
+                            verification_text = done_text
+                            # Try to extract failure reason
+                            if ":" in done_text.split("Verification: Failed")[1]:
+                                failure_reason = done_text.split("Verification: Failed")[1].split(":")[1].strip()
+                            break
+        
+        # If we still couldn't find verification text, check the final result
         if not verification_passed and not verification_failed and final_result:
             if "Verification: Passed" in final_result:
                 verification_passed = True
@@ -846,9 +955,6 @@ async def run_verification_test(
             elif "Verification: Failed" in final_result:
                 verification_failed = True
                 verification_text = final_result
-                # Try to extract failure reason if available
-                if ":" in final_result.split("Verification: Failed")[1]:
-                    failure_reason = final_result.split("Verification: Failed")[1].split(":")[1].strip()
         
         # Generate the appropriate HTML based on verification result
         if verification_passed:
@@ -857,7 +963,8 @@ async def run_verification_test(
                 <div class="test-result-header">Test: {formatted_test_name}</div>
                 <div class="verification-passed">✅ PASSED</div>
                 <div class="test-details passed">
-                    <strong>Agent Output:</strong> {verification_text}
+                    <strong>Verification Status:</strong> {verification_text}
+                    <br><br><strong>Agent Output:</strong> {final_result}
                 </div>
             </div>
             """
@@ -868,8 +975,9 @@ async def run_verification_test(
                 <div class="test-result-header">Test: {formatted_test_name}</div>
                 <div class="verification-failed">❌ FAILED</div>
                 <div class="test-details failed">
-                    <strong>Agent Output:</strong> {verification_text}
+                    <strong>Verification Status:</strong> {verification_text}
                     <br><br><strong>Reason:</strong> {failure_reason if failure_reason else "Test conditions were not met."}
+                    <br><br><strong>Agent Output:</strong> {final_result}
                 </div>
             </div>
             """
@@ -944,10 +1052,6 @@ COMPLETED: {now}
             f.write(log_entry)
     except Exception as e:
         logger.error(f"Error writing to log file: {str(e)}")
-
-def update_llm_num_ctx_visibility(provider):
-    """Show/hide the context length slider based on the provider."""
-    return gr.update(visible=provider == "ollama")
 
 def create_ui(config, theme_name="Ocean"):
     css = """
@@ -1024,6 +1128,7 @@ def create_ui(config, theme_name="Ocean"):
         font-weight: bold;
         margin-bottom: 10px;
         font-size: 16px;
+        color: #333;
     }
     .test-details {
         margin-top: 15px;
@@ -1033,6 +1138,7 @@ def create_ui(config, theme_name="Ocean"):
         border-left: 4px solid #ccc;
         line-height: 1.5;
         white-space: pre-line;
+        color: #333;
     }
     .test-details.passed {
         border-left-color: green;
@@ -1045,7 +1151,7 @@ def create_ui(config, theme_name="Ocean"):
     }
     .test-details strong {
         font-weight: bold;
-        color: #333;
+        color: #000;
     }
     .analysis-section {
         margin-top: 10px;
@@ -1053,6 +1159,7 @@ def create_ui(config, theme_name="Ocean"):
         background-color: #f5f5f5;
         border-radius: 5px;
         font-style: italic;
+        color: #333;
     }
     """
 
@@ -1296,6 +1403,28 @@ def create_ui(config, theme_name="Ocean"):
                         label="Verification Condition",
                         lines=2,
                         placeholder="e.g., Verify that the 2nd issue title is 'Fix Bug XYZ'"
+                    )
+                    
+                    # Save/Load Test Case
+                    with gr.Row():
+                        save_test_button = gr.Button("💾 Save Test Case", variant="secondary")
+                        load_test_dropdown = gr.Dropdown(
+                            label="Load Saved Test Case",
+                            choices=list_test_cases(),
+                            type="value",
+                            interactive=True
+                        )
+                        refresh_tests_button = gr.Button("🔄 Refresh", size="sm")
+                        load_test_file = gr.File(
+                            label="Or Upload Test Case File",
+                            file_types=[".json"],
+                            type="filepath"
+                        )
+                    
+                    test_status = gr.Textbox(
+                        label="Status",
+                        interactive=False,
+                        visible=True
                     )
 
                     # LLM Configuration
@@ -1579,6 +1708,55 @@ def create_ui(config, theme_name="Ocean"):
                     save_recording_path, save_trace_path
                 ],
                 outputs=[verification_result, pass_fail_badge]
+            )
+            
+            # Save Test Case Button
+            save_test_button.click(
+                fn=lambda test_case_name, task_description, verification_condition: (
+                    save_test_case(test_case_name, task_description, verification_condition)[0],  # Get status message
+                    gr.update(choices=list_test_cases())  # Refresh dropdown
+                ),
+                inputs=[test_case_name, task_description, verification_condition],
+                outputs=[test_status, load_test_dropdown]
+            )
+            
+            # Load Test Case from File
+            load_test_file.change(
+                fn=load_test_case,
+                inputs=[load_test_file],
+                outputs=[test_status, test_case_name, task_description, verification_condition]
+            )
+            
+            # Load Test Case from Dropdown
+            def load_test_from_dropdown(selected_test):
+                if not selected_test:
+                    return "No test case selected", gr.update(), gr.update(), gr.update()
+                
+                try:
+                    import json
+                    with open(selected_test, "r") as f:
+                        test_case = json.load(f)
+                    
+                    return (
+                        f"Test case '{test_case['name']}' loaded successfully",
+                        gr.update(value=test_case.get("name", "")),
+                        gr.update(value=test_case.get("task_description", "")),
+                        gr.update(value=test_case.get("verification_condition", ""))
+                    )
+                except Exception as e:
+                    return f"Error loading test case: {str(e)}", gr.update(), gr.update(), gr.update()
+            
+            load_test_dropdown.change(
+                fn=load_test_from_dropdown,
+                inputs=[load_test_dropdown],
+                outputs=[test_status, test_case_name, task_description, verification_condition]
+            )
+            
+            # Refresh Test Cases Button
+            refresh_tests_button.click(
+                fn=lambda: (gr.update(choices=list_test_cases()), "Test case list refreshed"),
+                inputs=[],
+                outputs=[load_test_dropdown, test_status]
             )
 
         # Attach the callback to the LLM provider dropdown

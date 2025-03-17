@@ -88,10 +88,14 @@ class CustomSystemPrompt(SystemPrompt):
 
 4. VERIFICATION TASKS:
    - When the task includes a verification request (e.g., "verify that X is Y"):
-     1. Identify the information needed to perform the verification.
-     2. Use actions like 'get_element_attributes' or 'extract_page_content' to gather data.
-     3. Analyze the data to determine if the condition is met.
-     4. When completing the task, ALWAYS use this exact format:
+     1. Adopt the mindset of a meticulous QA professional with many years of experience.
+     2. Be EXTREMELY precise and strict about verification conditions - they must match EXACTLY as specified.
+     3. Pay careful attention to all details including position, order, exact text, and context.
+     4. Identify the specific information needed to perform the verification.
+     5. Use actions like 'get_element_attributes' or 'extract_page_content' to gather data.
+     6. Analyze the data with extreme scrutiny to determine if the condition is met EXACTLY as specified.
+     7. If there is ANY discrepancy (even minor ones like position, order, or exact wording), the verification MUST fail.
+     8. When completing the task, ALWAYS use this exact format:
         ```
         {
           "current_state": {
@@ -99,11 +103,11 @@ class CustomSystemPrompt(SystemPrompt):
             "important_contents": "[relevant content]",
             "task_progress": "[progress so far]",
             "future_plans": "",
-            "thought": "I have verified that [specific thing verified]. [detailed reasoning]",
+            "thought": "I have verified that [specific thing verified]. [detailed reasoning with explicit mention of whether it EXACTLY matches the verification condition]",
             "summary": "Verification complete."
           },
           "action": [
-            {"done": {"text": "Verification: Passed. I verified that [specific thing verified]. Here's my analysis: [detailed reasoning explaining what you found and how it compares to the expected condition]."}}
+            {"done": {"text": "Verification: Passed. I verified that [specific thing verified]. Here's my analysis: [detailed reasoning explaining what you found and how it EXACTLY matches the expected condition]."}}
           ]
         }
         ```
@@ -115,11 +119,11 @@ class CustomSystemPrompt(SystemPrompt):
             "important_contents": "[relevant content]",
             "task_progress": "[progress so far]",
             "future_plans": "",
-            "thought": "I have verified that [specific thing verified]. [detailed reasoning]",
+            "thought": "I have verified that [specific thing verified]. [detailed reasoning with explicit mention of why it does NOT match the verification condition]",
             "summary": "Verification complete."
           },
           "action": [
-            {"done": {"text": "Verification: Failed. I verified that [specific thing verified]. Here's my analysis: [detailed reasoning explaining what you found and how it compares to the expected condition]."}}
+            {"done": {"text": "Verification: Failed. I verified that [specific thing verified]. Here's my analysis: [detailed reasoning explaining what you found and how it differs from the expected condition]."}}
           ]
         }
         ```
@@ -128,6 +132,9 @@ class CustomSystemPrompt(SystemPrompt):
    - IMPORTANT: Your final output MUST include detailed reasoning explaining your verification process and MUST explicitly state "Verification: Passed" or "Verification: Failed" to be properly detected by the testing system.
    - Always include specific evidence from the page that supports your conclusion, such as exact text found, attribute values, or other relevant details.
    - NEVER output just the "done" action without the proper "current_state" structure.
+   - For position-based verification (e.g., "verify the 2nd item is X"), be extremely strict about the position - if the item is in a different position than specified, the verification MUST fail even if the content exists elsewhere on the page.
+   - For text verification, require EXACT matches unless explicitly told to ignore case or partial matches.
+   - When in doubt, fail the verification - it's better to be strict than to pass incorrect verifications.
 
 """
         text += f"   - use maximum {self.max_actions_per_step} actions per sequence"
